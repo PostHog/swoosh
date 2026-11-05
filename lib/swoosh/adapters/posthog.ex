@@ -118,23 +118,28 @@ defmodule Swoosh.Adapters.PostHog do
     end
   end
 
+  defp refuse_unsupported(%Email{to: to}) when length(to) != 1,
+    do: unsupported_error(:multiple_to)
+
   defp refuse_unsupported(email) do
-    case unsupported(email) do
-      nil -> :ok
-      reason -> unsupported_error(reason)
-    end
-  end
-
-  defp unsupported(%Email{to: to}) when length(to) != 1, do: :multiple_to
-
-  defp unsupported(email) do
     cond do
-      Enum.any?(email.attachments, &inline_without_cid?/1) -> :inline_without_cid
-      Enum.any?(Map.keys(email.headers), &(not ignored_header?(&1))) -> :unsupported_header
-      has_option?(email, :tags) -> :tags
-      has_option?(email, :metadata) -> :metadata
-      has_option?(email, :scheduled_at) or has_option?(email, :send_at) -> :scheduled_send
-      true -> nil
+      Enum.any?(email.attachments, &inline_without_cid?/1) ->
+        unsupported_error(:inline_without_cid)
+
+      Enum.any?(Map.keys(email.headers), &(not ignored_header?(&1))) ->
+        unsupported_error(:unsupported_header)
+
+      has_option?(email, :tags) ->
+        unsupported_error(:tags)
+
+      has_option?(email, :metadata) ->
+        unsupported_error(:metadata)
+
+      has_option?(email, :scheduled_at) or has_option?(email, :send_at) ->
+        unsupported_error(:scheduled_send)
+
+      true ->
+        :ok
     end
   end
 
