@@ -63,9 +63,10 @@ defmodule Swoosh.Adapters.PostHog do
 
   ## Using templates
 
-  A template made in PostHog sets its own sender, subject and content, so the
-  email carries only the recipient. The `from` that `Swoosh.Mailer` requires is
-  not sent.
+  A template made in PostHog sets its own sender, subject, content and
+  engagement setting, so the email carries only the recipient, `distinct_id`
+  and `idempotency_key`. The `from` that `Swoosh.Mailer` requires, and the
+  `template_key` and `capture_engagement` options, are not sent.
 
       new()
       |> from("shop@example.com")
