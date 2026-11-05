@@ -133,6 +133,33 @@ defmodule Swoosh.Adapters.PostHogTest do
       assert {:ok, _} = PostHog.deliver(email, config)
     end
 
+    for {name, sent} <- [
+          {"Acme, Inc", ~s("Acme, Inc" <shop@example.com>)},
+          {~s(The "Best" Shop), ~s("The \\"Best\\" Shop" <shop@example.com>)}
+        ] do
+      test "quotes the from name #{name}", %{bypass: bypass, config: config, shipped: email} do
+        expect_body(bypass, shipped_body(%{"from" => unquote(sent)}))
+
+        assert {:ok, _} =
+                 PostHog.deliver(from(email, {unquote(name), "shop@example.com"}), config)
+      end
+    end
+
+    test "leaves out an attachment's unset content type", %{
+      bypass: bypass,
+      config: config,
+      shipped: email
+    } do
+      email = attachment(email, Swoosh.Attachment.new({:data, "x"}, filename: "notes"))
+
+      expect_body(
+        bypass,
+        shipped_body(%{"attachments" => [%{"filename" => "notes", "content" => "eA=="}]})
+      )
+
+      assert {:ok, _} = PostHog.deliver(email, config)
+    end
+
     test "case 04: sends attachments and inline parts with their content id", %{
       bypass: bypass,
       config: config,
@@ -444,7 +471,7 @@ defmodule Swoosh.Adapters.PostHogTest do
     } do
       respond_with(bypass, 503, "Service Unavailable")
 
-      assert {:error, %{status: 503, code: nil, detail: nil, retryable: true}} =
+      assert {:error, %{status: 503, code: nil, detail: "Service Unavailable", retryable: true}} =
                PostHog.deliver(email, config)
     end
 

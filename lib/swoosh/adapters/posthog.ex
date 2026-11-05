@@ -109,6 +109,7 @@ defmodule Swoosh.Adapters.PostHog do
   @api_endpoint "/api/projects/@current/messaging/send/email/"
   @integration "swoosh"
   @template_key ~r/\A[a-zA-Z0-9_-]{1,400}\z/
+  @mailbox_specials ~r/[()<>\[\]:;@\\,."]/
   @ignored_header ~r/\A(message-id|date|mime-version|content-.+|x-mailer)\z/i
 
   def deliver(%Email{} = email, config \\ []) do
@@ -208,7 +209,13 @@ defmodule Swoosh.Adapters.PostHog do
 
   defp sender(nil), do: nil
   defp sender({name, address}) when name in [nil, ""], do: address
-  defp sender({name, address}), do: "#{name} <#{address}>"
+  defp sender({name, address}), do: "#{display_name(name)} <#{address}>"
+
+  defp display_name(name) do
+    if Regex.match?(@mailbox_specials, name), do: quoted(name), else: name
+  end
+
+  defp quoted(name), do: "\"" <> String.replace(name, ~r/["\\]/, "\\\\\\0") <> "\""
 
   defp reply_to(email), do: List.wrap(email.reply_to)
 
@@ -217,9 +224,9 @@ defmodule Swoosh.Adapters.PostHog do
   defp attachment(attachment) do
     %{
       "filename" => attachment.filename,
-      "content_type" => attachment.content_type,
       "content" => Swoosh.Attachment.get_content(attachment, :base64)
     }
+    |> put_present("content_type", attachment.content_type)
     |> put_present("content_id", if(attachment.type == :inline, do: attachment.cid))
   end
 
@@ -303,7 +310,7 @@ defmodule Swoosh.Adapters.PostHog do
   defp decode(response) do
     case Swoosh.json_library().decode(response) do
       {:ok, %{} = fields} -> fields
-      _ -> %{}
+      _ -> %{"detail" => response}
     end
   end
 end
