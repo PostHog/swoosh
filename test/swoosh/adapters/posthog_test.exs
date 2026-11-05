@@ -60,7 +60,9 @@ defmodule Swoosh.Adapters.PostHogTest do
   defp respond_with(bypass, status, body, headers \\ []) do
     Bypass.expect_once(bypass, "POST", @send_path, fn conn ->
       headers
-      |> Enum.reduce(conn, fn {name, value}, conn -> Plug.Conn.put_resp_header(conn, name, value) end)
+      |> Enum.reduce(conn, fn {name, value}, conn ->
+        Plug.Conn.put_resp_header(conn, name, value)
+      end)
       |> Plug.Conn.resp(status, body)
     end)
   end
@@ -136,23 +138,21 @@ defmodule Swoosh.Adapters.PostHogTest do
       config: config,
       shipped: email
     } do
-      email =
-        email
-        |> html_body(~s(<img src="cid:logo">))
-        |> attachment(
-          Swoosh.Attachment.new({:data, Base.decode64!("JVBERi0xLjQK")},
-            filename: "invoice.pdf",
-            content_type: "application/pdf"
-          )
+      invoice =
+        Swoosh.Attachment.new({:data, Base.decode64!("JVBERi0xLjQK")},
+          filename: "invoice.pdf",
+          content_type: "application/pdf"
         )
-        |> attachment(
-          Swoosh.Attachment.new({:data, Base.decode64!("iVBORw0KGgo=")},
-            filename: "logo.png",
-            content_type: "image/png",
-            type: :inline,
-            cid: "logo"
-          )
+
+      logo =
+        Swoosh.Attachment.new({:data, Base.decode64!("iVBORw0KGgo=")},
+          filename: "logo.png",
+          content_type: "image/png",
+          type: :inline,
+          cid: "logo"
         )
+
+      email = %{html_body(email, ~s(<img src="cid:logo">)) | attachments: [invoice, logo]}
 
       expect_body(
         bypass,
