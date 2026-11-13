@@ -2,6 +2,7 @@ defmodule Swoosh.Adapters.PostHogTest do
   use Swoosh.AdapterCase, async: true
 
   import Swoosh.Email
+  import Plug.Conn, only: [get_req_header: 2]
   alias Swoosh.Adapters.PostHog
 
   defmodule Mailer do
@@ -40,8 +41,9 @@ defmodule Swoosh.Adapters.PostHogTest do
 
   defp expect_body(bypass, body) do
     expect_send(bypass, fn conn ->
-      assert get_header(conn, "x-posthog-integration") =~ ~r|\Aswoosh/[0-9A-Za-z.+-]{1,40}\z|
-      assert get_header(conn, "idempotency-key") == nil
+      assert [integration] = get_req_header(conn, "x-posthog-integration")
+      assert integration =~ ~r|\Aswoosh/[0-9A-Za-z.+-]{1,40}\z|
+      assert get_req_header(conn, "idempotency-key") == []
       assert conn.body_params == body
     end)
   end
@@ -74,13 +76,6 @@ defmodule Swoosh.Adapters.PostHogTest do
     Jason.encode!(%{type: "validation_error", code: code, detail: detail, attr: attr})
   end
 
-  defp get_header(conn, key) do
-    case Enum.find(conn.req_headers, fn {k, _} -> k == key end) do
-      {_, value} -> value
-      nil -> nil
-    end
-  end
-
   describe "rendered form" do
     test "case 01: sends a minimal rendered email and returns its message id", %{
       bypass: bypass,
@@ -88,10 +83,10 @@ defmodule Swoosh.Adapters.PostHogTest do
       shipped: email
     } do
       expect_send(bypass, fn conn ->
-        assert get_header(conn, "authorization") == "Bearer phs_test"
-        assert get_header(conn, "content-type") == "application/json"
-        assert get_header(conn, "x-posthog-integration") == "swoosh/#{Swoosh.version()}"
-        assert get_header(conn, "idempotency-key") == nil
+        assert get_req_header(conn, "authorization") == ["Bearer phs_test"]
+        assert get_req_header(conn, "content-type") == ["application/json"]
+        assert get_req_header(conn, "x-posthog-integration") == ["swoosh/#{Swoosh.version()}"]
+        assert get_req_header(conn, "idempotency-key") == []
         assert conn.body_params == shipped_body()
       end)
 
@@ -162,7 +157,7 @@ defmodule Swoosh.Adapters.PostHogTest do
         |> put_provider_option(:sensitive, true)
 
       expect_send(bypass, fn conn ->
-        assert get_header(conn, "idempotency-key") == "order-981-shipped"
+        assert get_req_header(conn, "idempotency-key") == ["order-981-shipped"]
 
         assert conn.body_params ==
                  shipped_body(%{
@@ -343,8 +338,8 @@ defmodule Swoosh.Adapters.PostHogTest do
       Bypass.expect_once(bypass, "POST", @uploads_path, fn conn ->
         conn = parse(conn)
         send(test_pid, {:request, :ask})
-        assert get_header(conn, "authorization") == "Bearer phs_test"
-        assert get_header(conn, "x-posthog-integration") == "swoosh/#{Swoosh.version()}"
+        assert get_req_header(conn, "authorization") == ["Bearer phs_test"]
+        assert get_req_header(conn, "x-posthog-integration") == ["swoosh/#{Swoosh.version()}"]
         assert conn.body_params == %{"files" => [file(@pdf), file(@png)]}
         json(conn, 200, %{"files" => [to_upload(@pdf, uploads <> "invoice"), present(@png)]})
       end)
@@ -354,9 +349,10 @@ defmodule Swoosh.Adapters.PostHogTest do
         send(test_pid, {:request, :upload})
         assert body == @pdf
         assert conn.query_string == "X-Amz-Signature=abc"
-        assert header_values(conn, "content-length") == ["#{byte_size(@pdf)}"]
-        assert header_values(conn, "x-amz-checksum-sha256") == [checksum(@pdf)]
-        assert header_values(conn, "authorization") == []
+        assert get_req_header(conn, "content-length") == ["#{byte_size(@pdf)}"]
+        assert get_req_header(conn, "x-amz-checksum-sha256") == [checksum(@pdf)]
+        assert get_req_header(conn, "authorization") == []
+        assert get_req_header(conn, "x-posthog-integration") == []
         Plug.Conn.resp(conn, 200, "")
       end)
 
@@ -415,32 +411,30 @@ defmodule Swoosh.Adapters.PostHogTest do
       assert {:ok, _} = PostHog.deliver(email, config)
     end
 
-    test "a failed upload returns a retryable error and sends nothing", %{
-      bypass: bypass,
-      config: config,
-      shipped: email,
-      uploads: uploads
-    } do
-      email = attachment(email, Swoosh.Attachment.new({:data, @pdf}, filename: "invoice.pdf"))
+    for {status, retryable} <- [{403, true}, {500, true}, {400, false}] do
+      test "a storage #{status} returns upload_failed, retryable: #{retryable}, and sends nothing",
+           %{bypass: bypass, config: config, shipped: email, uploads: uploads} do
+        email = attachment(email, Swoosh.Attachment.new({:data, @pdf}, filename: "invoice.pdf"))
 
-      Bypass.expect_once(bypass, "POST", @uploads_path, fn conn ->
-        json(conn, 200, %{"files" => [to_upload(@pdf, uploads <> "invoice")]})
-      end)
+        Bypass.expect_once(bypass, "POST", @uploads_path, fn conn ->
+          json(conn, 200, %{"files" => [to_upload(@pdf, uploads <> "invoice")]})
+        end)
 
-      Bypass.expect_once(bypass, "PUT", "/s3/invoice", fn conn ->
-        Plug.Conn.resp(conn, 403, "<Error><Code>AccessDenied</Code></Error>")
-      end)
+        Bypass.expect_once(bypass, "PUT", "/s3/invoice", fn conn ->
+          Plug.Conn.resp(conn, unquote(status), "<Error><Code>Nope</Code></Error>")
+        end)
 
-      assert PostHog.deliver(email, config) ==
-               {:error,
-                %{
-                  status: 403,
-                  code: "upload_failed",
-                  detail: "<Error><Code>AccessDenied</Code></Error>",
-                  attr: nil,
-                  retryable: true,
-                  retry_after: nil
-                }}
+        assert PostHog.deliver(email, config) ==
+                 {:error,
+                  %{
+                    status: unquote(status),
+                    code: "upload_failed",
+                    detail: "<Error><Code>Nope</Code></Error>",
+                    attr: nil,
+                    retryable: unquote(retryable),
+                    retry_after: nil
+                  }}
+      end
     end
 
     test "an upload that can't reach its host is a retryable network error", %{
@@ -469,12 +463,49 @@ defmodule Swoosh.Adapters.PostHogTest do
       email = attachment(email, Swoosh.Attachment.new({:data, @pdf}, filename: "invoice.pdf"))
 
       Bypass.expect_once(bypass, "POST", @uploads_path, fn conn ->
-        answer = Map.put(to_upload(@pdf, uploads <> "invoice"), "method", "PATCH")
+        answer = Map.put(to_upload(@pdf, uploads <> "invoice"), "method", "POST")
         json(conn, 200, %{"files" => [answer]})
       end)
 
       assert {:error, %{status: nil, code: "upload_failed", retryable: false}} =
                PostHog.deliver(email, config)
+    end
+
+    for {label, answer} <- [
+          {"without files", %{}},
+          {"with an unknown status", %{"files" => [%{"status" => "later"}]}}
+        ] do
+      test "an upload route answer #{label} returns upload_failed and sends nothing", %{
+        bypass: bypass,
+        config: config,
+        shipped: email
+      } do
+        email = attachment(email, Swoosh.Attachment.new({:data, @pdf}, filename: "invoice.pdf"))
+
+        Bypass.expect_once(bypass, "POST", @uploads_path, fn conn ->
+          json(conn, 200, unquote(Macro.escape(answer)))
+        end)
+
+        assert {:error, %{status: nil, code: "upload_failed", retryable: false}} =
+                 PostHog.deliver(email, config)
+      end
+    end
+
+    test "a network error on the upload route says the email wasn't sent", %{
+      bypass: bypass,
+      config: config,
+      shipped: email
+    } do
+      email = attachment(email, Swoosh.Attachment.new({:data, @pdf}, filename: "invoice.pdf"))
+      Bypass.down(bypass)
+
+      assert {:error,
+              %{
+                status: nil,
+                code: "network_error",
+                detail: "The request to PostHog failed, so the email wasn't sent.",
+                retryable: true
+              }} = PostHog.deliver(email, config)
     end
 
     test "an error from the upload route returns the API error and sends nothing", %{
@@ -548,8 +579,6 @@ defmodule Swoosh.Adapters.PostHogTest do
     |> Plug.Conn.resp(status, Jason.encode!(body))
   end
 
-  defp header_values(conn, name), do: for({^name, value} <- conn.req_headers, do: value)
-
   defp requests do
     receive do
       {:request, request} -> [request | requests()]
@@ -564,6 +593,15 @@ defmodule Swoosh.Adapters.PostHogTest do
       shipped: email
     } do
       email = put_provider_option(email, :template_key, "order shipped!")
+
+      assert PostHog.deliver(email, config) == {:error, {:unsupported, :invalid_template_key}}
+    end
+
+    test "refuses a configured default template key PostHog can't take", %{
+      config: config,
+      shipped: email
+    } do
+      config = Keyword.put(config, :default_template_key, "order shipped!")
 
       assert PostHog.deliver(email, config) == {:error, {:unsupported, :invalid_template_key}}
     end
@@ -703,6 +741,25 @@ defmodule Swoosh.Adapters.PostHogTest do
 
       assert {:error, %{status: 503, code: nil, detail: "Service Unavailable", retryable: true}} =
                PostHog.deliver(email, config)
+    end
+
+    test "a success without a message id is a retryable error, not a sent email", %{
+      bypass: bypass,
+      config: config,
+      shipped: email
+    } do
+      respond_with(bypass, 200, "<html>Down for maintenance</html>")
+
+      assert PostHog.deliver(email, config) ==
+               {:error,
+                %{
+                  status: 200,
+                  code: "invalid_response",
+                  detail: "<html>Down for maintenance</html>",
+                  attr: nil,
+                  retryable: true,
+                  retry_after: nil
+                }}
     end
 
     test "a network error is retryable", %{bypass: bypass, config: config, shipped: email} do
