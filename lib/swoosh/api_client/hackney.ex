@@ -30,8 +30,7 @@ defmodule Swoosh.ApiClient.Hackney do
     :ok
   end
 
-  # Options that put the app's credentials on a request.
-  @credentials [:basic_auth, :cookie]
+  @credential_options [:basic_auth, :cookie]
 
   @impl true
   def post(url, headers, body, %Swoosh.Email{} = email) do
@@ -47,7 +46,7 @@ defmodule Swoosh.ApiClient.Hackney do
   defp hackney_options(email),
     do: email.private[:hackney_options] || email.private[:client_options] || []
 
-  defp credential?({key, _value}), do: key in @credentials
+  defp credential?({key, _value}), do: key in @credential_options
   defp credential?(_option), do: false
 
   defp send_request(method, url, headers, body, hackney_options) do

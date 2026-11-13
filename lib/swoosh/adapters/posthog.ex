@@ -134,8 +134,9 @@ defmodule Swoosh.Adapters.PostHog do
   `retry_after` (seconds, or `nil`). A network error has `status: nil`, the
   code `"network_error"` and the client's `reason`. A failed file upload has
   the code `"upload_failed"`, the storage host's `status` and its response as
-  `detail`; the email isn't sent. It is retryable when the upload URL expired
-  or the storage host had a passing fault, since a retry asks for a fresh URL.
+  `detail`; the email isn't sent. It is retryable when the upload URL or its
+  signing token expired, the storage host timed out the upload, or it had a
+  passing fault, since a retry asks for a fresh URL.
   A success PostHog didn't write, such as a proxy's page, has the code
   `"invalid_response"` and the response as `detail`, on the send and the upload
   routes alike.
@@ -266,19 +267,15 @@ defmodule Swoosh.Adapters.PostHog do
   defp sender({name, address}) when name in [nil, ""], do: ascii(address)
   defp sender({name, address}), do: "#{display_name(name)} <#{ascii(address)}>"
 
-  # PostHog takes recipients on ASCII domains only, and matches the sender against the domains it
-  # verified, which are ASCII too, so an internationalized domain goes out in Punycode. An ASCII
-  # domain goes as given, and one IDNA can't encode goes as given for PostHog to refuse by name.
   defp ascii(address) do
     {local, domain} = address |> String.split("@") |> Enum.split(-1)
 
-    if local == [] or ascii?(hd(domain)),
+    if local == [] or ascii_bytes?(hd(domain)),
       do: address,
       else: Enum.join(local, "@") <> "@" <> punycode(hd(domain))
   end
 
-  # A byte check, since PCRE before OTP 28 matches `[[:ascii:]]` on any byte without the u flag.
-  defp ascii?(text), do: text |> :binary.bin_to_list() |> Enum.all?(&(&1 < 128))
+  defp ascii_bytes?(text), do: text |> :binary.bin_to_list() |> Enum.all?(&(&1 < 128))
 
   defp punycode(domain) do
     domain |> String.downcase() |> :idna.utf8_to_ascii() |> to_string()
@@ -364,7 +361,7 @@ defmodule Swoosh.Adapters.PostHog do
         :ok
 
       {:ok, status, _headers, response} ->
-        {:error, upload_error(status, response, storage_retryable?(status, response))}
+        {:error, upload_error(status, response, fresh_url_may_succeed?(status, response))}
 
       {:error, reason} ->
         {:error, network_error(reason, "The file upload failed, so the email wasn't sent.")}
@@ -382,11 +379,16 @@ defmodule Swoosh.Adapters.PostHog do
     {:error, upload_error(nil, "PostHog's upload route answered #{inspect(answer)}.", false)}
   end
 
-  # A retry of the send asks for a fresh upload URL, so an expired one, or a
-  # passing fault of the storage host, is worth a retry.
-  defp storage_retryable?(status, _response) when status in [429, 500, 502, 503, 504], do: true
-  defp storage_retryable?(403, response), do: response =~ "<Message>Request has expired</Message>"
-  defp storage_retryable?(_status, _response), do: false
+  defp fresh_url_may_succeed?(status, _response) when status in [429, 500, 502, 503, 504],
+    do: true
+
+  defp fresh_url_may_succeed?(400, response),
+    do: response =~ "<Code>RequestTimeout</Code>" or response =~ "<Code>ExpiredToken</Code>"
+
+  defp fresh_url_may_succeed?(403, response),
+    do: response =~ "<Message>Request has expired</Message>"
+
+  defp fresh_url_may_succeed?(_status, _response), do: false
 
   defp upload_error(status, detail, retryable) do
     %{
