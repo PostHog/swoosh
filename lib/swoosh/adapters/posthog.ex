@@ -136,8 +136,9 @@ defmodule Swoosh.Adapters.PostHog do
   the code `"upload_failed"`, the storage host's `status` and its response as
   `detail`; the email isn't sent. It is retryable when the upload URL expired
   or the storage host had a passing fault, since a retry asks for a fresh URL.
-  A success without a `message_id`, such as a
-  proxy's page, has the code `"invalid_response"` and the response as `detail`.
+  A success PostHog didn't write, such as a proxy's page, has the code
+  `"invalid_response"` and the response as `detail`, on the send and the upload
+  routes alike.
   Retry only when `retryable` is true, and with the same `idempotency_key`: a
   503, a network error or an invalid response may still have sent the email.
   The adapter doesn't retry by itself.
@@ -271,10 +272,13 @@ defmodule Swoosh.Adapters.PostHog do
   defp ascii(address) do
     {local, domain} = address |> String.split("@") |> Enum.split(-1)
 
-    if local == [] or Regex.match?(~r/\A[[:ascii:]]*\z/, hd(domain)),
+    if local == [] or ascii?(hd(domain)),
       do: address,
       else: Enum.join(local, "@") <> "@" <> punycode(hd(domain))
   end
+
+  # A byte check, since PCRE before OTP 28 matches `[[:ascii:]]` on any byte without the u flag.
+  defp ascii?(text), do: text |> :binary.bin_to_list() |> Enum.all?(&(&1 < 128))
 
   defp punycode(domain) do
     domain |> String.downcase() |> :idna.utf8_to_ascii() |> to_string()
@@ -331,10 +335,10 @@ defmodule Swoosh.Adapters.PostHog do
 
     contents = Map.new(files, &{&1.sha256, &1.content})
 
-    with {:ok, _status, response} <-
+    with {:ok, status, response} <-
            post(@uploads_endpoint, request, api_headers(), email, config, @not_sent) do
-      case decode(response) do
-        %{"files" => answers} when is_list(answers) ->
+      case Swoosh.json_library().decode(response) do
+        {:ok, %{"files" => answers}} when is_list(answers) ->
           Enum.reduce_while(answers, :ok, fn answer, :ok ->
             case upload(answer, contents[answer["sha256"]], email) do
               :ok -> {:cont, :ok}
@@ -342,8 +346,11 @@ defmodule Swoosh.Adapters.PostHog do
             end
           end)
 
-        _fields ->
+        {:ok, _fields} ->
           {:error, upload_error(nil, "PostHog's upload route answered without files.", false)}
+
+        {:error, _reason} ->
+          {:error, invalid_response(status, response)}
       end
     end
   end
