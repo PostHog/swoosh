@@ -60,6 +60,8 @@ defmodule Swoosh.Adapters.PostHog do
 
     * `template_data` (map) - the data for that template.
 
+  For example:
+
       import Swoosh.Email
 
       new()
@@ -82,7 +84,8 @@ defmodule Swoosh.Adapters.PostHog do
   for US Cloud or `*.s3.eu-central-1.amazonaws.com` for EU Cloud.
 
   The upload needs an API client that implements `c:Swoosh.ApiClient.request/5`,
-  as the clients that come with Swoosh do.
+  as the clients that come with Swoosh do. With another client, an email with
+  attachments is refused as `:api_client_cannot_upload` before any request.
 
   ## Using templates
 
@@ -110,7 +113,10 @@ defmodule Swoosh.Adapters.PostHog do
     * `:scheduled_send` - the `scheduled_at` or `send_at` provider options.
     * `:template_with_content` - a `template` together with a subject, body,
       cc, bcc, reply-to, attachments, `tracking` or `sensitive`.
-    * `:invalid_template_key` - a `template_key` PostHog can't take.
+    * `:invalid_template_key` - a `template_key`, or a configured
+      `default_template_key`, PostHog can't take.
+    * `:api_client_cannot_upload` - attachments, with an API client that can't
+      upload them (see "Attachments").
 
   Recipient display names are dropped, since PostHog takes bare addresses; the
   `from` display name is kept.
@@ -122,9 +128,11 @@ defmodule Swoosh.Adapters.PostHog do
   `retry_after` (seconds, or `nil`). A network error has `status: nil`, the
   code `"network_error"` and the client's `reason`. A failed file upload has
   the code `"upload_failed"`, the storage host's `status` and its response as
-  `detail`; the email isn't sent. Retry only when `retryable` is true, and with
-  the same `idempotency_key`: a 503 or a network error may still have sent the
-  email. The adapter doesn't retry by itself.
+  `detail`; the email isn't sent. A success without a `message_id`, such as a
+  proxy's page, has the code `"invalid_response"` and the response as `detail`.
+  Retry only when `retryable` is true, and with the same `idempotency_key`: a
+  503, a network error or an invalid response may still have sent the email.
+  The adapter doesn't retry by itself.
   """
 
   use Swoosh.Adapter, required_config: [:api_key]
@@ -137,14 +145,20 @@ defmodule Swoosh.Adapters.PostHog do
   @integration "swoosh"
   @template_key ~r/\A[a-zA-Z0-9_-]{1,400}\z/
   @mailbox_specials ~r/[()<>\[\]:;@\\,."]/
+  @may_be_sent "The request to PostHog failed, so the email may or may not have been sent."
+  @not_sent "The request to PostHog failed, so the email wasn't sent."
   @ignored_header ~r/\A(message-id|date|mime-version|content-.+|x-mailer)\z/i
 
   def deliver(%Email{} = email, config \\ []) do
     with :ok <- refuse_unsupported(email),
          {:ok, body} <- prepare_body(email, config),
          {:ok, body} <- attach_files(body, email, config),
-         {:ok, fields} <- post(@send_endpoint, body, send_headers(email), email, config) do
-      {:ok, %{id: fields["message_id"]}}
+         {:ok, status, response} <-
+           post(@send_endpoint, body, send_headers(email), email, config, @may_be_sent) do
+      case decode(response) do
+        %{"message_id" => id} when is_binary(id) and id != "" -> {:ok, %{id: id}}
+        _fields -> {:error, invalid_response(status, response)}
+      end
     end
   end
 
@@ -155,6 +169,9 @@ defmodule Swoosh.Adapters.PostHog do
     cond do
       Enum.any?(email.attachments, &inline_without_cid?/1) ->
         unsupported_error(:inline_without_cid)
+
+      email.attachments != [] and not Swoosh.ApiClient.supports_method?(:put) ->
+        unsupported_error(:api_client_cannot_upload)
 
       Enum.any?(Map.keys(email.headers), &(not ignored_header?(&1))) ->
         unsupported_error(:unsupported_header)
@@ -208,15 +225,11 @@ defmodule Swoosh.Adapters.PostHog do
   end
 
   defp template_key(email, config) do
-    case email.provider_options[:template_key] do
-      nil ->
-        {:ok, config[:default_template_key] || @integration}
+    key = email.provider_options[:template_key] || config[:default_template_key] || @integration
 
-      key ->
-        if valid_template_key?(key),
-          do: {:ok, key},
-          else: unsupported_error(:invalid_template_key)
-    end
+    if valid_template_key?(key),
+      do: {:ok, key},
+      else: unsupported_error(:invalid_template_key)
   end
 
   defp valid_template_key?(key), do: is_binary(key) and Regex.match?(@template_key, key)
@@ -283,20 +296,20 @@ defmodule Swoosh.Adapters.PostHog do
 
     contents = Map.new(files, &{&1.sha256, &1.content})
 
-    case post(@uploads_endpoint, request, api_headers(), email, config) do
-      {:ok, %{"files" => answers}} when is_list(answers) ->
-        Enum.reduce_while(answers, :ok, fn answer, :ok ->
-          case upload(answer, contents[answer["sha256"]], email) do
-            :ok -> {:cont, :ok}
-            error -> {:halt, error}
-          end
-        end)
+    with {:ok, _status, response} <-
+           post(@uploads_endpoint, request, api_headers(), email, config, @not_sent) do
+      case decode(response) do
+        %{"files" => answers} when is_list(answers) ->
+          Enum.reduce_while(answers, :ok, fn answer, :ok ->
+            case upload(answer, contents[answer["sha256"]], email) do
+              :ok -> {:cont, :ok}
+              error -> {:halt, error}
+            end
+          end)
 
-      {:ok, _fields} ->
-        {:error, upload_error(nil, "PostHog's upload route answered without files.", false)}
-
-      error ->
-        error
+        _fields ->
+          {:error, upload_error(nil, "PostHog's upload route answered without files.", false)}
+      end
     end
   end
 
@@ -325,7 +338,6 @@ defmodule Swoosh.Adapters.PostHog do
   end
 
   defp upload_method("PUT"), do: {:ok, :put}
-  defp upload_method("POST"), do: {:ok, :post}
 
   defp upload_method(method) do
     {:error, upload_error(nil, "PostHog asked for an upload with #{inspect(method)}.", false)}
@@ -342,24 +354,20 @@ defmodule Swoosh.Adapters.PostHog do
     }
   end
 
-  defp post(endpoint, body, headers, email, config) do
+  defp post(endpoint, body, headers, email, config, network_detail) do
     url = [base_url(config), endpoint]
     payload = Swoosh.json_library().encode!(body)
     headers = [{"Authorization", "Bearer #{config[:api_key]}"} | headers]
 
     case Swoosh.ApiClient.post(url, headers, payload, email) do
       {:ok, status, _headers, response} when status in 200..299 ->
-        {:ok, decode(response)}
+        {:ok, status, response}
 
       {:ok, status, headers, response} ->
         {:error, api_error(status, headers, response)}
 
       {:error, reason} ->
-        {:error,
-         network_error(
-           reason,
-           "The request to PostHog failed, so the email may or may not have been sent."
-         )}
+        {:error, network_error(reason, network_detail)}
     end
   end
 
@@ -391,6 +399,17 @@ defmodule Swoosh.Adapters.PostHog do
       attr: fields["attr"],
       retryable: retryable?(status, fields["code"]),
       retry_after: retry_after(headers)
+    }
+  end
+
+  defp invalid_response(status, response) do
+    %{
+      status: status,
+      code: "invalid_response",
+      detail: response,
+      attr: nil,
+      retryable: true,
+      retry_after: nil
     }
   end
 

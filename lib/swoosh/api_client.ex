@@ -14,7 +14,7 @@ defmodule Swoosh.ApiClient do
   @type headers :: [{binary(), binary()}]
   @type body :: binary()
   @type status :: pos_integer()
-  @type method :: atom()
+  @type method :: :get | :head | :post | :put | :patch | :delete | :options
 
   @doc """
   Callback to initializes the given api client.
@@ -56,7 +56,7 @@ defmodule Swoosh.ApiClient do
     client = api_client()
 
     cond do
-      Code.ensure_loaded?(client) and function_exported?(client, :request, 5) ->
+      implements_request?(client) ->
         client.request(method, url, headers, body, email)
 
       method == :post ->
@@ -68,6 +68,15 @@ defmodule Swoosh.ApiClient do
                 "#{method |> to_string() |> String.upcase()} requests"
     end
   end
+
+  @doc """
+  Whether the configured client can send a request with the given method
+  through `request/5`.
+  """
+  def supports_method?(method), do: method == :post or implements_request?(api_client())
+
+  defp implements_request?(client),
+    do: Code.ensure_loaded?(client) and function_exported?(client, :request, 5)
 
   @doc false
   def init do

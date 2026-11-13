@@ -37,7 +37,6 @@ defmodule Swoosh.ApiClient.RequestTest do
 
   defp use_client(client), do: Application.put_env(:swoosh, :api_client, client)
 
-
   for client <- [Swoosh.ApiClient.Hackney, Swoosh.ApiClient.Finch, Swoosh.ApiClient.Req] do
     test "#{inspect(client)} sends a PUT with the given headers and the raw body", %{
       bypass: bypass
