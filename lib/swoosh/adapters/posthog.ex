@@ -44,7 +44,17 @@ defmodule Swoosh.Adapters.PostHog do
       from a stable id when a job queue such as Oban retries the send, so a retry
       never sends twice.
 
-    * `capture_engagement` (boolean) - whether PostHog tracks opens and clicks.
+    * `tracking` (boolean or map) - what PostHog tracks. `true` tracks opens,
+      clicks and engagement events, `false` tracks none of them, and a map such
+      as `%{opens: true, clicks: false, engagement: true}` sets each one. Left
+      out, PostHog counts opens and captures engagement events, and tracks
+      clicks only when the email isn't sensitive.
+
+    * `sensitive` (boolean) - `true` for an email with login links, reset
+      tokens or codes: PostHog leaves its links unchanged unless `tracking`
+      turns clicks on, and keeps its subject off engagement events and its
+      content out of logs. Left out, the email is sensitive unless a template
+      made in PostHog with the same `template_key` says otherwise.
 
     * `template` (string) - the id of an email template made in PostHog.
 
@@ -60,13 +70,26 @@ defmodule Swoosh.Adapters.PostHog do
       |> put_provider_option(:distinct_id, "user_42")
       |> put_provider_option(:template_key, "order-shipped")
       |> put_provider_option(:idempotency_key, "order-981-shipped")
+      |> put_provider_option(:tracking, %{clicks: false})
+
+  ## Attachments
+
+  PostHog takes files by their SHA-256. Before each send with attachments, the
+  adapter asks PostHog which files it lacks, uploads those to the URL PostHog
+  gives (an Amazon S3 host, not the PostHog host), and then sends the email.
+  A file PostHog still has from an earlier send isn't uploaded again. If your
+  network limits outgoing traffic, allow HTTPS to `*.s3.us-east-1.amazonaws.com`
+  for US Cloud or `*.s3.eu-central-1.amazonaws.com` for EU Cloud.
+
+  The upload needs an API client that implements `c:Swoosh.ApiClient.request/5`,
+  as the clients that come with Swoosh do.
 
   ## Using templates
 
-  A template made in PostHog sets its own sender, subject, content and
-  engagement setting, so the email carries only the recipient, `distinct_id`
-  and `idempotency_key`. The `from` that `Swoosh.Mailer` requires, and the
-  `template_key` and `capture_engagement` options, are not sent.
+  A template made in PostHog sets its own sender, subject, content, tracking
+  and sensitivity, so the email carries only the recipient, `distinct_id` and
+  `idempotency_key`. The `from` that `Swoosh.Mailer` requires, and the
+  `template_key` option, are not sent.
 
       new()
       |> from("shop@example.com")
@@ -86,7 +109,7 @@ defmodule Swoosh.Adapters.PostHog do
     * `:tags`, `:metadata` - the `tags` or `metadata` provider options.
     * `:scheduled_send` - the `scheduled_at` or `send_at` provider options.
     * `:template_with_content` - a `template` together with a subject, body,
-      cc, bcc, reply-to or attachments.
+      cc, bcc, reply-to, attachments, `tracking` or `sensitive`.
     * `:invalid_template_key` - a `template_key` PostHog can't take.
 
   Recipient display names are dropped, since PostHog takes bare addresses; the
@@ -97,9 +120,11 @@ defmodule Swoosh.Adapters.PostHog do
   An API error returns `{:error, error}`, where `error` is a map with the
   `status`, the API's `code`, `detail` and `attr`, `retryable` and
   `retry_after` (seconds, or `nil`). A network error has `status: nil`, the
-  code `"network_error"` and the client's `reason`. Retry only when `retryable`
-  is true, and with the same `idempotency_key`: a 503 or a network error may
-  still have sent the email. The adapter doesn't retry by itself.
+  code `"network_error"` and the client's `reason`. A failed file upload has
+  the code `"upload_failed"`, the storage host's `status` and its response as
+  `detail`; the email isn't sent. Retry only when `retryable` is true, and with
+  the same `idempotency_key`: a 503 or a network error may still have sent the
+  email. The adapter doesn't retry by itself.
   """
 
   use Swoosh.Adapter, required_config: [:api_key]
@@ -107,7 +132,8 @@ defmodule Swoosh.Adapters.PostHog do
   alias Swoosh.Email
 
   @base_url "https://us.posthog.com"
-  @api_endpoint "/api/projects/@current/messaging/send/email/"
+  @send_endpoint "/api/projects/@current/messaging/send/email/"
+  @uploads_endpoint "/api/projects/@current/messaging/attachments/uploads/"
   @integration "swoosh"
   @template_key ~r/\A[a-zA-Z0-9_-]{1,400}\z/
   @mailbox_specials ~r/[()<>\[\]:;@\\,."]/
@@ -115,8 +141,10 @@ defmodule Swoosh.Adapters.PostHog do
 
   def deliver(%Email{} = email, config \\ []) do
     with :ok <- refuse_unsupported(email),
-         {:ok, body} <- prepare_body(email, config) do
-      post(email, body, config)
+         {:ok, body} <- prepare_body(email, config),
+         {:ok, body} <- attach_files(body, email, config),
+         {:ok, fields} <- post(@send_endpoint, body, send_headers(email), email, config) do
+      {:ok, %{id: fields["message_id"]}}
     end
   end
 
@@ -169,7 +197,8 @@ defmodule Swoosh.Adapters.PostHog do
 
   defp has_content?(email) do
     email.subject != "" or email.html_body != nil or email.text_body != nil or
-      email.cc != [] or email.bcc != [] or reply_to(email) != [] or email.attachments != []
+      email.cc != [] or email.bcc != [] or reply_to(email) != [] or email.attachments != [] or
+      has_option?(email, :tracking) or has_option?(email, :sensitive)
   end
 
   defp template_body(email, template_id) do
@@ -201,9 +230,9 @@ defmodule Swoosh.Adapters.PostHog do
     |> put_present("cc", addresses(email.cc))
     |> put_present("bcc", addresses(email.bcc))
     |> put_present("reply_to", addresses(reply_to(email)))
-    |> put_present("attachments", Enum.map(email.attachments, &attachment/1))
     |> put_present("distinct_id", email.provider_options[:distinct_id])
-    |> put_present("capture_engagement", email.provider_options[:capture_engagement])
+    |> put_present("tracking", email.provider_options[:tracking])
+    |> put_present("sensitive", email.provider_options[:sensitive])
   end
 
   defp recipient(%Email{to: [{_name, address}]}), do: address
@@ -222,48 +251,133 @@ defmodule Swoosh.Adapters.PostHog do
 
   defp addresses(recipients), do: Enum.map(recipients, fn {_name, address} -> address end)
 
-  defp attachment(attachment) do
-    %{
-      "filename" => attachment.filename,
-      "content" => Swoosh.Attachment.get_content(attachment, :base64)
-    }
+  defp put_present(body, _key, value) when value in [nil, []], do: body
+  defp put_present(body, key, value), do: Map.put(body, key, value)
+
+  defp attach_files(body, %Email{attachments: []}, _config), do: {:ok, body}
+
+  defp attach_files(body, email, config) do
+    files = Enum.map(email.attachments, &file/1)
+
+    with :ok <- upload_missing(Enum.uniq_by(files, & &1.sha256), email, config) do
+      {:ok, Map.put(body, "attachments", Enum.map(files, &attachment/1))}
+    end
+  end
+
+  defp file(attachment) do
+    content = Swoosh.Attachment.get_content(attachment)
+    sha256 = :sha256 |> :crypto.hash(content) |> Base.encode16(case: :lower)
+    %{attachment: attachment, content: content, sha256: sha256}
+  end
+
+  defp attachment(%{attachment: attachment, sha256: sha256}) do
+    %{"sha256" => sha256, "filename" => attachment.filename}
     |> put_present("content_type", attachment.content_type)
     |> put_present("content_id", if(attachment.type == :inline, do: attachment.cid))
   end
 
-  defp put_present(body, _key, value) when value in [nil, []], do: body
-  defp put_present(body, key, value), do: Map.put(body, key, value)
+  defp upload_missing(files, email, config) do
+    request = %{
+      "files" => Enum.map(files, &%{"sha256" => &1.sha256, "size" => byte_size(&1.content)})
+    }
 
-  defp post(email, body, config) do
-    url = [base_url(config), @api_endpoint]
+    contents = Map.new(files, &{&1.sha256, &1.content})
+
+    case post(@uploads_endpoint, request, api_headers(), email, config) do
+      {:ok, %{"files" => answers}} when is_list(answers) ->
+        Enum.reduce_while(answers, :ok, fn answer, :ok ->
+          case upload(answer, contents[answer["sha256"]], email) do
+            :ok -> {:cont, :ok}
+            error -> {:halt, error}
+          end
+        end)
+
+      {:ok, _fields} ->
+        {:error, upload_error(nil, "PostHog's upload route answered without files.", false)}
+
+      error ->
+        error
+    end
+  end
+
+  defp upload(%{"status" => "upload", "method" => method, "url" => url} = answer, content, email)
+       when is_binary(content) do
+    headers = for {name, value} <- answer["headers"] || %{}, do: {String.downcase(name), value}
+
+    with {:ok, method} <- upload_method(method) do
+      case Swoosh.ApiClient.request(method, url, headers, content, email) do
+        {:ok, status, _headers, _response} when status in 200..299 ->
+          :ok
+
+        {:ok, status, _headers, response} ->
+          {:error, upload_error(status, response, status == 403 or status >= 500)}
+
+        {:error, reason} ->
+          {:error, network_error(reason, "The file upload failed, so the email wasn't sent.")}
+      end
+    end
+  end
+
+  defp upload(%{"status" => "present"}, _content, _email), do: :ok
+
+  defp upload(answer, _content, _email) do
+    {:error, upload_error(nil, "PostHog's upload route answered #{inspect(answer)}.", false)}
+  end
+
+  defp upload_method("PUT"), do: {:ok, :put}
+  defp upload_method("POST"), do: {:ok, :post}
+
+  defp upload_method(method) do
+    {:error, upload_error(nil, "PostHog asked for an upload with #{inspect(method)}.", false)}
+  end
+
+  defp upload_error(status, detail, retryable) do
+    %{
+      status: status,
+      code: "upload_failed",
+      detail: detail,
+      attr: nil,
+      retryable: retryable,
+      retry_after: nil
+    }
+  end
+
+  defp post(endpoint, body, headers, email, config) do
+    url = [base_url(config), endpoint]
     payload = Swoosh.json_library().encode!(body)
+    headers = [{"Authorization", "Bearer #{config[:api_key]}"} | headers]
 
-    case Swoosh.ApiClient.post(url, request_headers(email, config), payload, email) do
+    case Swoosh.ApiClient.post(url, headers, payload, email) do
       {:ok, status, _headers, response} when status in 200..299 ->
-        {:ok, %{id: response |> decode() |> Map.get("message_id")}}
+        {:ok, decode(response)}
 
       {:ok, status, headers, response} ->
         {:error, api_error(status, headers, response)}
 
       {:error, reason} ->
-        {:error, network_error(reason)}
+        {:error,
+         network_error(
+           reason,
+           "The request to PostHog failed, so the email may or may not have been sent."
+         )}
     end
   end
 
   defp base_url(config), do: String.trim_trailing(config[:base_url] || @base_url, "/")
 
-  defp request_headers(email, config) do
-    headers = [
-      {"Authorization", "Bearer #{config[:api_key]}"},
+  defp api_headers do
+    [
       {"Content-Type", "application/json"},
       {"Accept", "application/json"},
       {"User-Agent", "swoosh/#{Swoosh.version()}"},
       {"X-PostHog-Integration", "#{@integration}/#{Swoosh.version()}"}
     ]
+  end
 
+  defp send_headers(email) do
     case email.provider_options[:idempotency_key] do
-      nil -> headers
-      key -> [{"Idempotency-Key", key} | headers]
+      nil -> api_headers()
+      key -> [{"Idempotency-Key", key} | api_headers()]
     end
   end
 
@@ -280,11 +394,11 @@ defmodule Swoosh.Adapters.PostHog do
     }
   end
 
-  defp network_error(reason) do
+  defp network_error(reason, detail) do
     %{
       status: nil,
       code: "network_error",
-      detail: "The request to PostHog failed, so the email may or may not have been sent.",
+      detail: detail,
       attr: nil,
       retryable: true,
       retry_after: nil,
@@ -294,6 +408,7 @@ defmodule Swoosh.Adapters.PostHog do
 
   defp retryable?(409, "idempotency_key_in_flight"), do: true
   defp retryable?(429, "quota_limited"), do: false
+  defp retryable?(429, "upload_quota_exceeded"), do: false
   defp retryable?(429, _code), do: true
   defp retryable?(503, _code), do: true
   defp retryable?(_status, _code), do: false

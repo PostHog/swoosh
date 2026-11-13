@@ -388,10 +388,13 @@ defmodule Swoosh.Adapters.PostHogTest do
 
     test "asks once for a file that two attachments share, and leaves out an unset content type",
          %{bypass: bypass, config: config, shipped: email} do
-      email =
+      email = %{
         email
-        |> attachment(Swoosh.Attachment.new({:data, @pdf}, filename: "copy-1"))
-        |> attachment(Swoosh.Attachment.new({:data, @pdf}, filename: "copy-2"))
+        | attachments: [
+            Swoosh.Attachment.new({:data, @pdf}, filename: "copy-1"),
+            Swoosh.Attachment.new({:data, @pdf}, filename: "copy-2")
+          ]
+      }
 
       Bypass.expect_once(bypass, "POST", @uploads_path, fn conn ->
         conn = parse(conn)
@@ -516,7 +519,11 @@ defmodule Swoosh.Adapters.PostHogTest do
   defp file(bytes), do: %{"sha256" => sha256(bytes), "size" => byte_size(bytes)}
 
   defp present(bytes),
-    do: %{"sha256" => sha256(bytes), "status" => "present", "expires_at" => "2026-12-16T09:00:00Z"}
+    do: %{
+      "sha256" => sha256(bytes),
+      "status" => "present",
+      "expires_at" => "2026-12-16T09:00:00Z"
+    }
 
   defp to_upload(bytes, url) do
     %{
