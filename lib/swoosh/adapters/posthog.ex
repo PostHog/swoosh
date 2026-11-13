@@ -26,8 +26,10 @@ defmodule Swoosh.Adapters.PostHog do
       `transactional_email:write` scope. The project capture key (`phc_...`)
       can't send email.
 
-    * `base_url` - the PostHog app host. Defaults to `https://us.posthog.com`.
-      Use `https://eu.posthog.com` for EU Cloud, or your own host when self-hosted.
+    * `base_url` - the PostHog app host, as an `http` or `https` URL. Defaults
+      to `https://us.posthog.com`. Use `https://eu.posthog.com` for EU Cloud, or
+      your own host when self-hosted. Any other value raises an `ArgumentError`
+      before a request goes out.
 
     * `default_template_key` - groups sends in PostHog's reporting when an email
       sets no `template_key`. Defaults to `swoosh`.
@@ -38,7 +40,7 @@ defmodule Swoosh.Adapters.PostHog do
       Without it, PostHog uses the recipient's address.
 
     * `template_key` (string) - groups sends in PostHog's reporting. Letters,
-      digits, `-` and `_`, at most 400.
+      digits, `-` and `_`, at most 256.
 
     * `idempotency_key` (string) - sent as the `Idempotency-Key` header. Set it
       from a stable id when a job queue such as Oban retries the send, so a retry
@@ -79,7 +81,9 @@ defmodule Swoosh.Adapters.PostHog do
   PostHog takes files by their SHA-256. Before each send with attachments, the
   adapter asks PostHog which files it lacks, uploads those to the URL PostHog
   gives (an Amazon S3 host, not the PostHog host), and then sends the email.
-  A file PostHog still has from an earlier send isn't uploaded again. If your
+  A file PostHog still has from an earlier send isn't uploaded again. An
+  attachment without a filename is sent as `attachment.<extension>` from its
+  content type, since PostHog needs one. If your
   network limits outgoing traffic, allow HTTPS to `*.s3.us-east-1.amazonaws.com`
   for US Cloud or `*.s3.eu-central-1.amazonaws.com` for EU Cloud.
 
@@ -92,7 +96,7 @@ defmodule Swoosh.Adapters.PostHog do
   A template made in PostHog sets its own sender, subject, content, tracking
   and sensitivity, so the email carries only the recipient, `distinct_id` and
   `idempotency_key`. The `from` that `Swoosh.Mailer` requires, and the
-  `template_key` option, are not sent.
+  `template_key`, `tracking` and `sensitive` options, are not sent.
 
       new()
       |> from("shop@example.com")
@@ -112,7 +116,7 @@ defmodule Swoosh.Adapters.PostHog do
     * `:tags`, `:metadata` - the `tags` or `metadata` provider options.
     * `:scheduled_send` - the `scheduled_at` or `send_at` provider options.
     * `:template_with_content` - a `template` together with a subject, body,
-      cc, bcc, reply-to, attachments, `tracking` or `sensitive`.
+      cc, bcc, reply-to or attachments.
     * `:invalid_template_key` - a `template_key`, or a configured
       `default_template_key`, PostHog can't take.
     * `:api_client_cannot_upload` - attachments, with an API client that can't
@@ -128,7 +132,9 @@ defmodule Swoosh.Adapters.PostHog do
   `retry_after` (seconds, or `nil`). A network error has `status: nil`, the
   code `"network_error"` and the client's `reason`. A failed file upload has
   the code `"upload_failed"`, the storage host's `status` and its response as
-  `detail`; the email isn't sent. A success without a `message_id`, such as a
+  `detail`; the email isn't sent. It is retryable when the upload URL expired
+  or the storage host had a passing fault, since a retry asks for a fresh URL.
+  A success without a `message_id`, such as a
   proxy's page, has the code `"invalid_response"` and the response as `detail`.
   Retry only when `retryable` is true, and with the same `idempotency_key`: a
   503, a network error or an invalid response may still have sent the email.
@@ -143,7 +149,7 @@ defmodule Swoosh.Adapters.PostHog do
   @send_endpoint "/api/projects/@current/messaging/send/email/"
   @uploads_endpoint "/api/projects/@current/messaging/attachments/uploads/"
   @integration "swoosh"
-  @template_key ~r/\A[a-zA-Z0-9_-]{1,400}\z/
+  @template_key ~r/\A[a-zA-Z0-9_-]{1,256}\z/
   @mailbox_specials ~r/[()<>\[\]:;@\\,."]/
   @may_be_sent "The request to PostHog failed, so the email may or may not have been sent."
   @not_sent "The request to PostHog failed, so the email wasn't sent."
@@ -214,8 +220,7 @@ defmodule Swoosh.Adapters.PostHog do
 
   defp has_content?(email) do
     email.subject != "" or email.html_body != nil or email.text_body != nil or
-      email.cc != [] or email.bcc != [] or reply_to(email) != [] or email.attachments != [] or
-      has_option?(email, :tracking) or has_option?(email, :sensitive)
+      email.cc != [] or email.bcc != [] or reply_to(email) != [] or email.attachments != []
   end
 
   defp template_body(email, template_id) do
@@ -284,9 +289,16 @@ defmodule Swoosh.Adapters.PostHog do
   end
 
   defp attachment(%{attachment: attachment, sha256: sha256}) do
-    %{"sha256" => sha256, "filename" => attachment.filename}
+    %{"sha256" => sha256, "filename" => attachment.filename || unnamed(attachment.content_type)}
     |> put_present("content_type", attachment.content_type)
     |> put_present("content_id", if(attachment.type == :inline, do: attachment.cid))
+  end
+
+  defp unnamed(content_type) do
+    case content_type && MIME.extensions(content_type) do
+      [extension | _] -> "attachment.#{extension}"
+      _none -> "attachment"
+    end
   end
 
   defp upload_missing(files, email, config) do
@@ -323,7 +335,7 @@ defmodule Swoosh.Adapters.PostHog do
           :ok
 
         {:ok, status, _headers, response} ->
-          {:error, upload_error(status, response, status == 403 or status >= 500)}
+          {:error, upload_error(status, response, storage_retryable?(status, response))}
 
         {:error, reason} ->
           {:error, network_error(reason, "The file upload failed, so the email wasn't sent.")}
@@ -336,6 +348,12 @@ defmodule Swoosh.Adapters.PostHog do
   defp upload(answer, _content, _email) do
     {:error, upload_error(nil, "PostHog's upload route answered #{inspect(answer)}.", false)}
   end
+
+  # A retry of the send asks for a fresh upload URL, so an expired one, or a
+  # passing fault of the storage host, is worth a retry.
+  defp storage_retryable?(status, _response) when status in [429, 500, 502, 503, 504], do: true
+  defp storage_retryable?(403, response), do: response =~ "<Message>Request has expired</Message>"
+  defp storage_retryable?(_status, _response), do: false
 
   defp upload_method("PUT"), do: {:ok, :put}
 
@@ -371,7 +389,20 @@ defmodule Swoosh.Adapters.PostHog do
     end
   end
 
-  defp base_url(config), do: String.trim_trailing(config[:base_url] || @base_url, "/")
+  defp base_url(config) do
+    url = String.trim_trailing(config[:base_url] || @base_url, "/")
+
+    case URI.parse(url) do
+      %URI{scheme: scheme, host: host}
+      when scheme in ["http", "https"] and host not in [nil, ""] ->
+        url
+
+      _uri ->
+        raise ArgumentError,
+              "PostHog's base_url must be an http or https URL, such as " <>
+                "https://eu.posthog.com, got: #{inspect(url)}"
+    end
+  end
 
   defp api_headers do
     [
