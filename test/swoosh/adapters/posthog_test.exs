@@ -286,6 +286,7 @@ defmodule Swoosh.Adapters.PostHogTest do
     for {label, domain, sent} <- [
           {"an uppercase internationalized domain in lowercase Punycode", "BÜCHER.example",
            "xn--bcher-kva.example"},
+          {"an ASCII domain as given, in its own case", "Example.COM", "Example.COM"},
           {"an ASCII domain as given, even one IDNA disallows", "Exa_mple.COM", "Exa_mple.COM"},
           {"a domain IDNA can't encode as given, for PostHog to refuse", "😀.example", "😀.example"}
         ] do
@@ -532,6 +533,8 @@ defmodule Swoosh.Adapters.PostHogTest do
     @expired "<Error><Code>AccessDenied</Code><Message>Request has expired</Message></Error>"
     @denied "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"
     @nope "<Error><Code>Nope</Code></Error>"
+    @timed_out "<Error><Code>RequestTimeout</Code><Message>Idle too long</Message></Error>"
+    @expired_token "<Error><Code>ExpiredToken</Code><Message>Token expired</Message></Error>"
 
     for {label, status, body, retryable} <- [
           {"an expired upload URL", 403, @expired, true},
@@ -541,6 +544,8 @@ defmodule Swoosh.Adapters.PostHogTest do
           {"a storage 502", 502, @nope, true},
           {"a storage 503", 503, @nope, true},
           {"a storage 504", 504, @nope, true},
+          {"an upload the storage host timed out", 400, @timed_out, true},
+          {"an upload URL signed with an expired token", 400, @expired_token, true},
           {"a storage 400", 400, @nope, false}
         ] do
       test "#{label} returns upload_failed, retryable: #{retryable}, and sends nothing",
