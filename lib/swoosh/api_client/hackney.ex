@@ -32,9 +32,15 @@ defmodule Swoosh.ApiClient.Hackney do
 
   @impl true
   def post(url, headers, body, %Swoosh.Email{} = email) do
+    request(:post, url, headers, body, email)
+  end
+
+  @impl true
+  def request(method, url, headers, body, %Swoosh.Email{} = email) do
     hackney_options = email.private[:hackney_options] || email.private[:client_options] || []
 
-    :hackney.post(
+    :hackney.request(
+      method,
       url,
       [@user_agent | headers],
       body,

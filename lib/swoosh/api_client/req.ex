@@ -4,8 +4,9 @@ defmodule Swoosh.ApiClient.Req do
 
       config :swoosh, :api_client, Swoosh.ApiClient.Req
 
-  Any `client_options` that are set will be passed along to `Req.post` but the
+  Any `client_options` that are set will be passed along to `Req.request` but the
   following keys will be overwritten as they are set by Swoosh explicitly:
+    * `method` and `url`
     * `headers`
     * `body`
     * `decode_body` - set to false as Adapters expect the raw response
@@ -40,6 +41,11 @@ defmodule Swoosh.ApiClient.Req do
 
   @impl true
   def post(url, headers, body, %Swoosh.Email{} = email) do
+    request(:post, url, headers, body, email)
+  end
+
+  @impl true
+  def request(method, url, headers, body, %Swoosh.Email{} = email) do
     url = IO.iodata_to_binary(url)
 
     options = email.private[:client_options] || []
@@ -48,6 +54,8 @@ defmodule Swoosh.ApiClient.Req do
     # that the body is a binary. Req will run `Jason.decode` itself and
     # `response.body` will already be a map if it is not set.
     required_options = [
+      method: method,
+      url: url,
       headers: [@user_agent | headers],
       body: body,
       decode_body: false
@@ -55,7 +63,7 @@ defmodule Swoosh.ApiClient.Req do
 
     options = Keyword.merge(options, required_options)
 
-    case Req.post(url, options) do
+    case Req.request(options) do
       {:ok, response} ->
         headers = Req.get_headers_list(response)
         {:ok, response.status, headers, response.body}

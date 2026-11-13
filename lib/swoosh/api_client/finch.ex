@@ -52,8 +52,13 @@ defmodule Swoosh.ApiClient.Finch do
 
   @impl true
   def post(url, headers, body, %Swoosh.Email{} = email) do
+    request(:post, url, headers, body, email)
+  end
+
+  @impl true
+  def request(method, url, headers, body, %Swoosh.Email{} = email) do
     url = IO.iodata_to_binary(url)
-    request = Finch.build(:post, url, [@user_agent | headers], body)
+    request = Finch.build(method, url, [@user_agent | headers], body)
     options = email.private[:client_options] || []
 
     case Finch.request(request, finch_name(), options) do
