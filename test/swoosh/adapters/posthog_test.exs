@@ -245,6 +245,44 @@ defmodule Swoosh.Adapters.PostHogTest do
       assert {:ok, _} = PostHog.deliver(email, Keyword.update!(config, :base_url, &(&1 <> "/")))
     end
 
+    test "sends an internationalized domain in Punycode, as PostHog verifies and takes it", %{
+      bypass: bypass,
+      config: config
+    } do
+      email =
+        new()
+        |> from({"Shop", "shop@bücher.example"})
+        |> to("ana@bücher.example")
+        |> cc("bo@bücher.example")
+        |> bcc("audit@bücher.example")
+        |> reply_to("help@bücher.example")
+        |> subject("Your order shipped")
+        |> text_body("On its way.")
+
+      expect_body(bypass, %{
+        "from" => "Shop <shop@xn--bcher-kva.example>",
+        "to" => "ana@xn--bcher-kva.example",
+        "cc" => ["bo@xn--bcher-kva.example"],
+        "bcc" => ["audit@xn--bcher-kva.example"],
+        "reply_to" => ["help@xn--bcher-kva.example"],
+        "subject" => "Your order shipped",
+        "text" => "On its way.",
+        "template_key" => "swoosh"
+      })
+
+      assert {:ok, _} = PostHog.deliver(email, config)
+    end
+
+    test "sends a sender without a name in Punycode too", %{
+      bypass: bypass,
+      config: config,
+      shipped: email
+    } do
+      expect_body(bypass, shipped_body(%{"from" => "shop@xn--bcher-kva.example"}))
+
+      assert {:ok, _} = PostHog.deliver(from(email, "shop@bücher.example"), config)
+    end
+
     test "takes a template key of 256 characters, the most PostHog takes", %{
       bypass: bypass,
       config: config,
@@ -293,6 +331,17 @@ defmodule Swoosh.Adapters.PostHogTest do
       email = put_provider_option(email, :template, @template_id)
 
       assert PostHog.deliver(email, config) == {:error, {:unsupported, :template_with_content}}
+    end
+
+    test "sends the recipient's internationalized domain in Punycode", %{
+      bypass: bypass,
+      config: config
+    } do
+      email = new() |> to("ana@bücher.example") |> put_provider_option(:template, @template_id)
+
+      expect_body(bypass, %{"to" => "ana@xn--bcher-kva.example", "template_id" => @template_id})
+
+      assert {:ok, _} = PostHog.deliver(email, config)
     end
 
     test "leaves out tracking and sensitive, since the template sets them", %{
@@ -661,6 +710,15 @@ defmodule Swoosh.Adapters.PostHogTest do
       shipped: email
     } do
       email = put_provider_option(email, :template_key, "order shipped!")
+
+      assert PostHog.deliver(email, config) == {:error, {:unsupported, :invalid_template_key}}
+    end
+
+    test "refuses a template key set to false instead of falling back to the default", %{
+      config: config,
+      shipped: email
+    } do
+      email = put_provider_option(email, :template_key, false)
 
       assert PostHog.deliver(email, config) == {:error, {:unsupported, :invalid_template_key}}
     end
