@@ -244,6 +244,17 @@ defmodule Swoosh.Adapters.PostHogTest do
 
       assert {:ok, _} = PostHog.deliver(email, Keyword.update!(config, :base_url, &(&1 <> "/")))
     end
+
+    test "takes a template key of 256 characters, the most PostHog takes", %{
+      bypass: bypass,
+      config: config,
+      shipped: email
+    } do
+      key = String.duplicate("k", 256)
+      expect_body(bypass, shipped_body(%{"template_key" => key}))
+
+      assert {:ok, _} = PostHog.deliver(put_provider_option(email, :template_key, key), config)
+    end
   end
 
   describe "template form" do
@@ -284,7 +295,23 @@ defmodule Swoosh.Adapters.PostHogTest do
       assert PostHog.deliver(email, config) == {:error, {:unsupported, :template_with_content}}
     end
 
-    for field <- [:cc, :bcc, :reply_to, :attachment, :tracking, :sensitive] do
+    test "leaves out tracking and sensitive, since the template sets them", %{
+      bypass: bypass,
+      config: config
+    } do
+      email =
+        new()
+        |> to("ana@example.com")
+        |> put_provider_option(:template, @template_id)
+        |> put_provider_option(:tracking, %{opens: true, clicks: false})
+        |> put_provider_option(:sensitive, true)
+
+      expect_body(bypass, %{"to" => "ana@example.com", "template_id" => @template_id})
+
+      assert {:ok, _} = PostHog.deliver(email, config)
+    end
+
+    for field <- [:cc, :bcc, :reply_to, :attachment] do
       test "refuses a template with #{field}", %{config: config} do
         email =
           new()
@@ -303,9 +330,6 @@ defmodule Swoosh.Adapters.PostHogTest do
 
   defp with_content(email, :attachment),
     do: attachment(email, Swoosh.Attachment.new({:data, "x"}, filename: "a.txt"))
-
-  defp with_content(email, :tracking), do: put_provider_option(email, :tracking, false)
-  defp with_content(email, :sensitive), do: put_provider_option(email, :sensitive, false)
 
   describe "attachments" do
     setup %{bypass: bypass} do
@@ -411,8 +435,52 @@ defmodule Swoosh.Adapters.PostHogTest do
       assert {:ok, _} = PostHog.deliver(email, config)
     end
 
-    for {status, retryable} <- [{403, true}, {500, true}, {400, false}] do
-      test "a storage #{status} returns upload_failed, retryable: #{retryable}, and sends nothing",
+    test "names an unnamed attachment after its content type, since PostHog needs a filename",
+         %{bypass: bypass, config: config, shipped: email} do
+      email = %{
+        email
+        | attachments: [
+            Swoosh.Attachment.new({:data, @pdf}, content_type: "application/pdf"),
+            Swoosh.Attachment.new({:data, @png})
+          ]
+      }
+
+      Bypass.expect_once(bypass, "POST", @uploads_path, fn conn ->
+        json(conn, 200, %{"files" => [present(@pdf), present(@png)]})
+      end)
+
+      expect_body(
+        bypass,
+        shipped_body(%{
+          "attachments" => [
+            %{
+              "sha256" => sha256(@pdf),
+              "filename" => "attachment.pdf",
+              "content_type" => "application/pdf"
+            },
+            %{"sha256" => sha256(@png), "filename" => "attachment"}
+          ]
+        })
+      )
+
+      assert {:ok, _} = PostHog.deliver(email, config)
+    end
+
+    @expired "<Error><Code>AccessDenied</Code><Message>Request has expired</Message></Error>"
+    @denied "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"
+    @nope "<Error><Code>Nope</Code></Error>"
+
+    for {label, status, body, retryable} <- [
+          {"an expired upload URL", 403, @expired, true},
+          {"any other 403", 403, @denied, false},
+          {"a storage 429", 429, @nope, true},
+          {"a storage 500", 500, @nope, true},
+          {"a storage 502", 502, @nope, true},
+          {"a storage 503", 503, @nope, true},
+          {"a storage 504", 504, @nope, true},
+          {"a storage 400", 400, @nope, false}
+        ] do
+      test "#{label} returns upload_failed, retryable: #{retryable}, and sends nothing",
            %{bypass: bypass, config: config, shipped: email, uploads: uploads} do
         email = attachment(email, Swoosh.Attachment.new({:data, @pdf}, filename: "invoice.pdf"))
 
@@ -421,7 +489,7 @@ defmodule Swoosh.Adapters.PostHogTest do
         end)
 
         Bypass.expect_once(bypass, "PUT", "/s3/invoice", fn conn ->
-          Plug.Conn.resp(conn, unquote(status), "<Error><Code>Nope</Code></Error>")
+          Plug.Conn.resp(conn, unquote(status), unquote(body))
         end)
 
         assert PostHog.deliver(email, config) ==
@@ -429,7 +497,7 @@ defmodule Swoosh.Adapters.PostHogTest do
                   %{
                     status: unquote(status),
                     code: "upload_failed",
-                    detail: "<Error><Code>Nope</Code></Error>",
+                    detail: unquote(body),
                     attr: nil,
                     retryable: unquote(retryable),
                     retry_after: nil
@@ -597,6 +665,12 @@ defmodule Swoosh.Adapters.PostHogTest do
       assert PostHog.deliver(email, config) == {:error, {:unsupported, :invalid_template_key}}
     end
 
+    test "refuses a template key over 256 characters", %{config: config, shipped: email} do
+      email = put_provider_option(email, :template_key, String.duplicate("k", 257))
+
+      assert PostHog.deliver(email, config) == {:error, {:unsupported, :invalid_template_key}}
+    end
+
     test "refuses a configured default template key PostHog can't take", %{
       config: config,
       shipped: email
@@ -698,6 +772,7 @@ defmodule Swoosh.Adapters.PostHogTest do
           {401, "authentication_failed"},
           {403, "permission_denied"},
           {404, "not_found"},
+          {400, "clicks_need_opens"},
           {422, "recipient_suppressed"},
           {429, "quota_limited"},
           {500, "error"}
@@ -779,6 +854,17 @@ defmodule Swoosh.Adapters.PostHogTest do
       expect_body(bypass, shipped_body())
 
       assert Mailer.deliver(email, config) == {:ok, %{id: @message_id}}
+    end
+
+    for base_url <- ["us.posthog.com", "ftp://us.posthog.com", "https://"] do
+      test "deliver/2 raises for the base_url #{base_url} before any request", %{
+        config: config,
+        shipped: email
+      } do
+        assert_raise ArgumentError, ~r/base_url must be an http or https URL/, fn ->
+          Mailer.deliver(email, Keyword.put(config, :base_url, unquote(base_url)))
+        end
+      end
     end
 
     test "deliver/2 needs an api_key", %{shipped: email} do
