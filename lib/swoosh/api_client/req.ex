@@ -10,6 +10,10 @@ defmodule Swoosh.ApiClient.Req do
     * `headers`
     * `body`
     * `decode_body` - set to false as Adapters expect the raw response
+
+  `request/5` also sets `auth` and `aws_sigv4` to `nil`, so the app's
+  credentials, from `client_options` or `Req.default_options/1`, don't reach
+  a presigned URL.
   """
 
   require Logger
@@ -41,14 +45,17 @@ defmodule Swoosh.ApiClient.Req do
 
   @impl true
   def post(url, headers, body, %Swoosh.Email{} = email) do
-    request(:post, url, headers, body, email)
+    send_request(:post, url, headers, body, email.private[:client_options] || [])
   end
 
   @impl true
   def request(method, url, headers, body, %Swoosh.Email{} = email) do
-    url = IO.iodata_to_binary(url)
+    options = Keyword.merge(email.private[:client_options] || [], auth: nil, aws_sigv4: nil)
+    send_request(method, url, headers, body, options)
+  end
 
-    options = email.private[:client_options] || []
+  defp send_request(method, url, headers, body, options) do
+    url = IO.iodata_to_binary(url)
 
     # Set `decode_body` option to false as Swoosh's Mailgun adapter expects
     # that the body is a binary. Req will run `Jason.decode` itself and

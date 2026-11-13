@@ -98,7 +98,7 @@ defmodule Swoosh.ApiClient.RequestTest do
           Email.put_private(email, key, value)
         end)
 
-      expect_posthog_upload(bypass)
+      expect_posthog_upload(bypass, unquote(credentials == []))
 
       assert {:ok, _} = Swoosh.Adapters.PostHog.deliver(email, posthog_config(bypass))
     end
@@ -115,7 +115,7 @@ defmodule Swoosh.ApiClient.RequestTest do
       Req.default_options(unquote(Macro.escape(defaults)))
       on_exit(fn -> Req.default_options(defaults) end)
 
-      expect_posthog_upload(bypass)
+      expect_posthog_upload(bypass, false)
 
       assert {:ok, _} = Swoosh.Adapters.PostHog.deliver(posthog_email(), posthog_config(bypass))
     end
@@ -129,7 +129,9 @@ defmodule Swoosh.ApiClient.RequestTest do
   defp posthog_config(bypass),
     do: [api_key: "phs_test", base_url: "http://localhost:#{bypass.port}"]
 
-  defp expect_posthog_upload(bypass) do
+  # The send goes through post/4 with the app's client options, as for every adapter, so
+  # its Authorization is PostHog's key only when the app sets no credentials of its own.
+  defp expect_posthog_upload(bypass, posthog_key_on_send?) do
     sha256 = :sha256 |> :crypto.hash(@bytes) |> Base.encode16(case: :lower)
     upload_headers = %{"Content-Length" => "4", "x-amz-checksum-sha256" => "c2lnbmVk"}
 
@@ -164,7 +166,9 @@ defmodule Swoosh.ApiClient.RequestTest do
     end)
 
     Bypass.expect_once(bypass, "POST", "/api/projects/@current/messaging/send/email/", fn conn ->
-      assert Plug.Conn.get_req_header(conn, "authorization") == ["Bearer phs_test"]
+      if posthog_key_on_send?,
+        do: assert(Plug.Conn.get_req_header(conn, "authorization") == ["Bearer phs_test"])
+
       Plug.Conn.resp(conn, 202, ~s({"message_id": "msg_1"}))
     end)
   end

@@ -32,6 +32,12 @@ defmodule Swoosh.ApiClient do
 
   Optional: a client without it takes only `:post`, through `c:post/4`.
   Adapters that upload files, such as `Swoosh.Adapters.PostHog`, need it.
+
+  Adapters use it for presigned storage URLs, so it sends only the given
+  headers: no credentials from the email's client options or from the HTTP
+  client's app-wide defaults, such as an `Authorization` header or a cookie.
+  The built-in clients drop Hackney's `basic_auth` and `cookie`, and Req's
+  `auth` and `aws_sigv4`.
   """
   @callback request(method, url, headers, body, Swoosh.Email.t()) ::
               {:ok, status, headers, body} | {:error, term()}
