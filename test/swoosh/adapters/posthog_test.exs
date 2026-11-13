@@ -283,6 +283,20 @@ defmodule Swoosh.Adapters.PostHogTest do
       assert {:ok, _} = PostHog.deliver(from(email, "shop@bücher.example"), config)
     end
 
+    for {label, domain, sent} <- [
+          {"an uppercase internationalized domain in lowercase Punycode", "BÜCHER.example",
+           "xn--bcher-kva.example"},
+          {"an ASCII domain as given, even one IDNA disallows", "Exa_mple.COM", "Exa_mple.COM"},
+          {"a domain IDNA can't encode as given, for PostHog to refuse", "😀.example", "😀.example"}
+        ] do
+      test "sends #{label}", %{bypass: bypass, config: config, shipped: email} do
+        expect_body(bypass, shipped_body(%{"to" => "ana@" <> unquote(sent)}))
+
+        assert {:ok, _} =
+                 PostHog.deliver(to(%{email | to: []}, "ana@" <> unquote(domain)), config)
+      end
+    end
+
     test "takes a template key of 256 characters, the most PostHog takes", %{
       bypass: bypass,
       config: config,

@@ -123,7 +123,9 @@ defmodule Swoosh.Adapters.PostHog do
       upload them (see "Attachments").
 
   Recipient display names are dropped, since PostHog takes bare addresses; the
-  `from` display name is kept.
+  `from` display name is kept. An internationalized domain, such as
+  `bücher.example`, is sent in Punycode (`xn--bcher-kva.example`), the form
+  PostHog verifies sender domains in.
 
   ## Errors
 
@@ -230,7 +232,11 @@ defmodule Swoosh.Adapters.PostHog do
   end
 
   defp template_key(email, config) do
-    key = email.provider_options[:template_key] || config[:default_template_key] || @integration
+    key =
+      Enum.find(
+        [email.provider_options[:template_key], config[:default_template_key], @integration],
+        &(&1 != nil)
+      )
 
     if valid_template_key?(key),
       do: {:ok, key},
@@ -253,11 +259,28 @@ defmodule Swoosh.Adapters.PostHog do
     |> put_present("sensitive", email.provider_options[:sensitive])
   end
 
-  defp recipient(%Email{to: [{_name, address}]}), do: address
+  defp recipient(%Email{to: [{_name, address}]}), do: ascii(address)
 
   defp sender(nil), do: nil
-  defp sender({name, address}) when name in [nil, ""], do: address
-  defp sender({name, address}), do: "#{display_name(name)} <#{address}>"
+  defp sender({name, address}) when name in [nil, ""], do: ascii(address)
+  defp sender({name, address}), do: "#{display_name(name)} <#{ascii(address)}>"
+
+  # PostHog takes recipients on ASCII domains only, and matches the sender against the domains it
+  # verified, which are ASCII too, so an internationalized domain goes out in Punycode. An ASCII
+  # domain goes as given, and one IDNA can't encode goes as given for PostHog to refuse by name.
+  defp ascii(address) do
+    {local, domain} = address |> String.split("@") |> Enum.split(-1)
+
+    if local == [] or Regex.match?(~r/\A[[:ascii:]]*\z/, hd(domain)),
+      do: address,
+      else: Enum.join(local, "@") <> "@" <> punycode(hd(domain))
+  end
+
+  defp punycode(domain) do
+    domain |> String.downcase() |> :idna.utf8_to_ascii() |> to_string()
+  catch
+    :exit, _reason -> domain
+  end
 
   defp display_name(name) do
     if Regex.match?(@mailbox_specials, name), do: quoted(name), else: name
@@ -267,7 +290,7 @@ defmodule Swoosh.Adapters.PostHog do
 
   defp reply_to(email), do: List.wrap(email.reply_to)
 
-  defp addresses(recipients), do: Enum.map(recipients, fn {_name, address} -> address end)
+  defp addresses(recipients), do: Enum.map(recipients, fn {_name, address} -> ascii(address) end)
 
   defp put_present(body, _key, value) when value in [nil, []], do: body
   defp put_present(body, key, value), do: Map.put(body, key, value)
@@ -325,22 +348,25 @@ defmodule Swoosh.Adapters.PostHog do
     end
   end
 
-  defp upload(%{"status" => "upload", "method" => method, "url" => url} = answer, content, email)
+  defp upload(%{"status" => "upload", "method" => "PUT", "url" => url} = answer, content, email)
        when is_binary(content) do
     headers = for {name, value} <- answer["headers"] || %{}, do: {String.downcase(name), value}
 
-    with {:ok, method} <- upload_method(method) do
-      case Swoosh.ApiClient.request(method, url, headers, content, email) do
-        {:ok, status, _headers, _response} when status in 200..299 ->
-          :ok
+    case Swoosh.ApiClient.request(:put, url, headers, content, email) do
+      {:ok, status, _headers, _response} when status in 200..299 ->
+        :ok
 
-        {:ok, status, _headers, response} ->
-          {:error, upload_error(status, response, storage_retryable?(status, response))}
+      {:ok, status, _headers, response} ->
+        {:error, upload_error(status, response, storage_retryable?(status, response))}
 
-        {:error, reason} ->
-          {:error, network_error(reason, "The file upload failed, so the email wasn't sent.")}
-      end
+      {:error, reason} ->
+        {:error, network_error(reason, "The file upload failed, so the email wasn't sent.")}
     end
+  end
+
+  defp upload(%{"status" => "upload", "method" => method}, _content, _email)
+       when method != "PUT" do
+    {:error, upload_error(nil, "PostHog asked for an upload with #{inspect(method)}.", false)}
   end
 
   defp upload(%{"status" => "present"}, _content, _email), do: :ok
@@ -354,12 +380,6 @@ defmodule Swoosh.Adapters.PostHog do
   defp storage_retryable?(status, _response) when status in [429, 500, 502, 503, 504], do: true
   defp storage_retryable?(403, response), do: response =~ "<Message>Request has expired</Message>"
   defp storage_retryable?(_status, _response), do: false
-
-  defp upload_method("PUT"), do: {:ok, :put}
-
-  defp upload_method(method) do
-    {:error, upload_error(nil, "PostHog asked for an upload with #{inspect(method)}.", false)}
-  end
 
   defp upload_error(status, detail, retryable) do
     %{
