@@ -622,6 +622,31 @@ defmodule Swoosh.Adapters.PostHogTest do
       end
     end
 
+    for {label, status, body} <- [
+          {"a proxy's page", 200, "<html>Down for maintenance</html>"},
+          {"an empty body", 204, ""}
+        ] do
+      test "an upload route success with #{label} is a retryable invalid_response, and sends nothing",
+           %{bypass: bypass, config: config, shipped: email} do
+        email = attachment(email, Swoosh.Attachment.new({:data, @pdf}, filename: "invoice.pdf"))
+
+        Bypass.expect_once(bypass, "POST", @uploads_path, fn conn ->
+          Plug.Conn.resp(conn, unquote(status), unquote(body))
+        end)
+
+        assert PostHog.deliver(email, config) ==
+                 {:error,
+                  %{
+                    status: unquote(status),
+                    code: "invalid_response",
+                    detail: unquote(body),
+                    attr: nil,
+                    retryable: true,
+                    retry_after: nil
+                  }}
+      end
+    end
+
     test "a network error on the upload route says the email wasn't sent", %{
       bypass: bypass,
       config: config,
